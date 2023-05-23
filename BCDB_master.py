@@ -104,27 +104,32 @@ youtube_icon_url = "https://storage.googleapis.com/bcdb_images/Youtube_logo.png"
 soundcloud_icon_url = "https://storage.googleapis.com/bcdb_images/soundcloud_logo.png"
 patreon_icon_url = "https://storage.googleapis.com/bcdb_images/patreon_logo.png"
 
-def get_image_url(bucket, folder, file_name):
+def get_image_url(bucket, file_name):
     image_url = None
 
     file_name_without_ext, _ = os.path.splitext(file_name)
-    
-    for blob in bucket.list_blobs(prefix=file_name_without_ext):
+    file_name_only = os.path.basename(file_name_without_ext)
+    folder_name = os.path.basename(os.path.dirname(file_name))
+
+    prefix = f"episode_art/{file_name_only}"
+    for blob in bucket.list_blobs(prefix=prefix):
         if blob.name.endswith(('.jpg', '.jpeg', '.png', '.gif')):
             image_url = f"https://storage.googleapis.com/{bucket.name}/{blob.name}"
             return image_url
 
-    if not image_url:
-        for blob in bucket.list_blobs(prefix=folder):
-            if blob.name.endswith(('.jpg', '.jpeg', '.png', '.gif')):
-                image_url = f"https://storage.googleapis.com/{bucket.name}/{blob.name}"
-                break
+    prefix = f"episode_art/{folder_name}"
+    for blob in bucket.list_blobs(prefix=prefix):
+        if blob.name.endswith(('.jpg', '.jpeg', '.png', '.gif')):
+            image_url = f"https://storage.googleapis.com/{bucket.name}/{blob.name}"
+            return image_url
 
     return image_url
 
 def extract_number(file_name):
     match = re.search(r'\d+', file_name)
     return int(match.group()) if match else float('inf')
+
+image_bucket = client.get_bucket('bcdb_images')
 
 if button_clicked:
     if not search_term.strip():
@@ -148,7 +153,7 @@ if button_clicked:
                 result_word = "result" if len(file_results) == 1 else "results"
 
                 if folder_name == "All Miniseries":
-                    image_url = get_image_url(bucket, file_folder, file_name)
+                    image_url = get_image_url(image_bucket, file_name)
                     if image_url:
                         st.markdown(f'<div style="text-align: left;"><img src="{image_url}" width="200"></div>', unsafe_allow_html=True)
 
