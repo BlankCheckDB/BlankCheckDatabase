@@ -28,7 +28,6 @@ def highlight_term(text, term):
     def replace(match):
         matched_text = match.group(0)
         color = "#D4AF37" if term.lower() == "comedy points" else "#AE88E1"
-        # if the term is 'night eggs', append '🥚' after 'eggs'
         if term.lower() == 'night eggs' and 'eggs' in matched_text.lower():
             matched_text = matched_text + ' 🥚'
         return f'<span style="font-weight: bold; color: {color};">{matched_text}</span>'
@@ -105,12 +104,22 @@ youtube_icon_url = "https://storage.googleapis.com/bcdb_images/Youtube_logo.png"
 soundcloud_icon_url = "https://storage.googleapis.com/bcdb_images/soundcloud_logo.png"
 patreon_icon_url = "https://storage.googleapis.com/bcdb_images/patreon_logo.png"
 
-def get_image_url(bucket, folder):
+def get_image_url(bucket, folder, file_name):
     image_url = None
-    for blob in bucket.list_blobs(prefix=folder):
+
+    file_name_without_ext, _ = os.path.splitext(file_name)
+    
+    for blob in bucket.list_blobs(prefix=file_name_without_ext):
         if blob.name.endswith(('.jpg', '.jpeg', '.png', '.gif')):
             image_url = f"https://storage.googleapis.com/{bucket.name}/{blob.name}"
-            break
+            return image_url
+
+    if not image_url:
+        for blob in bucket.list_blobs(prefix=folder):
+            if blob.name.endswith(('.jpg', '.jpeg', '.png', '.gif')):
+                image_url = f"https://storage.googleapis.com/{bucket.name}/{blob.name}"
+                break
+
     return image_url
 
 def extract_number(file_name):
@@ -139,7 +148,7 @@ if button_clicked:
                 result_word = "result" if len(file_results) == 1 else "results"
 
                 if folder_name == "All Miniseries":
-                    image_url = get_image_url(bucket, file_folder)
+                    image_url = get_image_url(bucket, file_folder, file_name)
                     if image_url:
                         st.markdown(f'<div style="text-align: left;"><img src="{image_url}" width="200"></div>', unsafe_allow_html=True)
 
@@ -200,7 +209,7 @@ st.markdown(f'<div style="text-align: center; font-size: 12px;">{google_form_tex
 twitter_icon_url = "https://storage.googleapis.com/bcdb_images/twitter_logo.png"
 twitter_page_url = "https://twitter.com/blankcheckdb"
 
-footer_text = "<a href='https://www.youtube.com/watch?v=MNLTgUZ8do4&t=3928s'>Beta</a> build May 15, 2023"
+footer_text = "<a href='https://www.youtube.com/watch?v=MNLTgUZ8do4&t=3928s'>Beta</a> build May 23, 2023"
 st.write(f'<div style="text-align: center;font-size: 12px;">{footer_text}</div>', unsafe_allow_html=True)
 
 twitter_icon_link = f'<a href="{twitter_page_url}" target="_blank"><img src="{twitter_icon_url}" width="30"></a>'
