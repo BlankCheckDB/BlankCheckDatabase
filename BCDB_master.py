@@ -30,6 +30,8 @@ def highlight_term(text, term):
         color = "#D4AF37" if term.lower() == "comedy points" else "#AE88E1"
         if term.lower() == 'night eggs' and 'eggs' in matched_text.lower():
             matched_text = matched_text + ' 🥚'
+        elif term.lower() == 'river of ham' and 'ham' in matched_text.lower():
+            matched_text = matched_text + ' 🐷'
         return f'<span style="font-weight: bold; color: {color};">{matched_text}</span>'
 
     return re.sub(rf'\b{re.escape(term)}\b', replace, text, flags=re.IGNORECASE)
