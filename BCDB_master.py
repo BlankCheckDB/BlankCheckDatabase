@@ -210,6 +210,11 @@ if button_clicked:
         else:
             st.write("No bits found.")
 
+st.markdown(
+    "<h1 style='text-align: center; font-size: 16pt;'>TIP: For faster searching, choose a miniseries first.</h1>",
+    unsafe_allow_html=True
+)
+
 google_form_text = "This buffoonery is not officially sanctioned by the <a href='https://www.blankcheckpod.com'>Blank Check</a> podcast."
 st.markdown(f'<div style="text-align: center; font-size: 12px;">{google_form_text}</div>', unsafe_allow_html=True)
 
