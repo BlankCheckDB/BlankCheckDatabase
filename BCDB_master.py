@@ -221,7 +221,7 @@ st.markdown(f'<div style="text-align: center; font-size: 12px;">{google_form_tex
 twitter_icon_url = "https://storage.googleapis.com/bcdb_images/twitter_logo.png"
 twitter_page_url = "https://twitter.com/blankcheckdb"
 
-footer_text = "<a href='https://www.youtube.com/watch?v=MNLTgUZ8do4&t=3928s'>Beta</a> build May 23, 2023"
+footer_text = "<a href='https://www.youtube.com/watch?v=MNLTgUZ8do4&t=3928s'>Beta</a> build September 22, 2023"
 st.write(f'<div style="text-align: center;font-size: 12px;">{footer_text}</div>', unsafe_allow_html=True)
 
 twitter_icon_link = f'<a href="{twitter_page_url}" target="_blank"><img src="{twitter_icon_url}" width="30"></a>'
