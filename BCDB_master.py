@@ -17,6 +17,9 @@ client = storage.Client(credentials=credentials)
 
 st.set_page_config(page_title="Blank Check Database", page_icon=":mag_right:")
 
+if 'reset' not in st.session_state:
+    st.session_state['reset'] = False
+
 def download_csv(data_frame, file_name):
     csv_buffer = StringIO()
     data_frame.to_csv(csv_buffer, sep=";", index=False)
@@ -24,16 +27,24 @@ def download_csv(data_frame, file_name):
     href = f'<a href="data:file/csv;base64,{b64}" download="{file_name}" target="_blank">Download</a>'
     return href
 
+term_styles = {
+    'comedy points': {'color': '#D4AF37', 'emoji': ''},
+    'night eggs': {'color': '#AE88E1', 'emoji': '🥚'},
+    'river of ham': {'color': '#AE88E1', 'emoji': '🐷'},
+    'david dog': {'color': '#AE88E1', 'emoji': '🐶'},
+    'burger report': {'color': '#AE88E1', 'emoji': '🍔'}
+}
+
 def highlight_term(text, term):
+    # Function to replace matched terms with styled HTML
     def replace(match):
         matched_text = match.group(0)
-        color = "#D4AF37" if term.lower() == "comedy points" else "#AE88E1"
-        if term.lower() == 'night eggs' and 'eggs' in matched_text.lower():
-            matched_text = matched_text + ' 🥚'
-        elif term.lower() == 'river of ham' and 'ham' in matched_text.lower():
-            matched_text = matched_text + ' 🐷'
-        return f'<span style="font-weight: bold; color: {color};">{matched_text}</span>'
+        # Get the styling rules for the term, defaulting to a generic style if not found
+        style = term_styles.get(term.lower(), {'color': '#AE88E1', 'emoji': ''})
+        # Construct the styled HTML string
+        return f'<span style="font-weight: bold; color: {style["color"]};">{matched_text}{style["emoji"]}</span>'
 
+    # Use regex to find and replace all instances of the term with the styled HTML
     return re.sub(rf'\b{re.escape(term)}\b', replace, text, flags=re.IGNORECASE)
 
 def process_blob(blob, search_term, folder_name):
@@ -86,6 +97,8 @@ bucket_name_mapping = {
 }
 display_names = list(bucket_name_mapping.keys())
 selected_display_name = st.selectbox("Select a feed:", display_names)
+#selected_display_name = st.radio("Select a feed:", display_names)#
+#above code is for using radio buttons instead of dropdown TBD which is better#
 bucket_name = bucket_name_mapping[selected_display_name]
 
 bucket = client.get_bucket(bucket_name)
@@ -132,6 +145,9 @@ def extract_number(file_name):
     return int(match.group()) if match else float('inf')
 
 image_bucket = client.get_bucket('bcdb_images')
+
+if st.button('Reset', type="primary"):
+    st.experimental_rerun()
 
 if button_clicked:
     if not search_term.strip():
@@ -182,17 +198,9 @@ if button_clicked:
                         st.markdown(f'<div style="margin-bottom: 2px;"><span style="color: #8E3497; font-weight: bold;">[{col1}]:</span> {highlight_term(col3, search_term)}</div>', unsafe_allow_html=True)
 
                     time_in_seconds = time_to_seconds(col1)
-                    if youtube_url:
-                        youtube_link = f"{youtube_url}&t={time_in_seconds}"
-                        youtube_icon = f'<a href="{youtube_link}" target="_blank"><img src="{youtube_icon_url}" width="30"></a>'
-                    else:
-                        youtube_icon = ""
-
-                    if soundcloud_url:
-                        soundcloud_link = f"{soundcloud_url}#t={time_in_seconds}"
-                        soundcloud_icon = f'<a href="{soundcloud_link}" target="_blank"><img src="{soundcloud_icon_url}" width="20"></a>'
-                    else:
-                        soundcloud_icon = ""
+                    youtube_icon = f'<a href="{youtube_url}&t={time_in_seconds}" target="_blank"><img src="{youtube_icon_url}" width="30"></a>' if youtube_url else ""
+                    soundcloud_icon = f'<a href="{soundcloud_url}#t={time_in_seconds}" target="_blank"><img src="{soundcloud_icon_url}" width="20"></a>' if soundcloud_url else ""
+                    patreon_icon = f'<a href="{patreon_url}" target="_blank"><img src="{patreon_icon_url}" width="20"></a>' if patreon_url else ""
 
                     if any(result[2] for result in file_results) and not patreon_icon_displayed:
                         patreon_url = next(result[2] for result in file_results if result[2])
@@ -204,7 +212,9 @@ if button_clicked:
 
                     movie_info = f'<span style="color: #FF424D; font-weight: bold;">Movie Timecode:</span> {col4}' if pd.notna(col4) else ""
 
-                    st.markdown(f'{youtube_icon} {soundcloud_icon} {patreon_icon} {movie_info}', unsafe_allow_html=True)
+                    combined_html = f'{youtube_icon} {soundcloud_icon} {patreon_icon} {movie_info}'
+
+                    st.markdown(combined_html, unsafe_allow_html=True)
 
                 st.write("---")
         else:
@@ -221,7 +231,7 @@ st.markdown(f'<div style="text-align: center; font-size: 12px;">{google_form_tex
 twitter_icon_url = "https://storage.googleapis.com/bcdb_images/twitter_logo.png"
 twitter_page_url = "https://twitter.com/blankcheckdb"
 
-footer_text = "<a href='https://www.youtube.com/watch?v=MNLTgUZ8do4&t=3928s'>Beta</a> build September 22, 2023"
+footer_text = "<a href='https://www.youtube.com/watch?v=MNLTgUZ8do4&t=3928s'>Beta</a> build March 21, 2024"
 st.write(f'<div style="text-align: center;font-size: 12px;">{footer_text}</div>', unsafe_allow_html=True)
 
 twitter_icon_link = f'<a href="{twitter_page_url}" target="_blank"><img src="{twitter_icon_url}" width="30"></a>'
