@@ -19,6 +19,8 @@ st.set_page_config(page_title="Blank Check Database", page_icon=":mag_right:")
 
 if 'reset' not in st.session_state:
     st.session_state['reset'] = False
+if 'button_clicked' not in st.session_state:
+    st.session_state['button_clicked'] = False
 
 def download_csv(data_frame, file_name):
     csv_buffer = StringIO()
@@ -36,15 +38,10 @@ term_styles = {
 }
 
 def highlight_term(text, term):
-    # Function to replace matched terms with styled HTML
     def replace(match):
         matched_text = match.group(0)
-        # Get the styling rules for the term, defaulting to a generic style if not found
         style = term_styles.get(term.lower(), {'color': '#AE88E1', 'emoji': ''})
-        # Construct the styled HTML string
         return f'<span style="font-weight: bold; color: {style["color"]};">{matched_text}{style["emoji"]}</span>'
-
-    # Use regex to find and replace all instances of the term with the styled HTML
     return re.sub(rf'\b{re.escape(term)}\b', replace, text, flags=re.IGNORECASE)
 
 def process_blob(blob, search_term, folder_name):
@@ -56,7 +53,6 @@ def process_blob(blob, search_term, folder_name):
         if not data.empty:
             url1, url2, url3 = data.iloc[0, 0], data.iloc[1, 0], data.iloc[2, 0]
             youtube_url = url1 if isinstance(url1, str) and 'youtube' in url1.lower() else url2 if isinstance(url2, str) and 'youtube' in url2.lower() else url3 if isinstance(url3, str) and 'youtube' in url3.lower() else None
-            soundcloud_url = url1 if isinstance(url1, str) and 'soundcloud' in url1.lower() else url2 if isinstance(url2, str) and 'soundcloud' in url2.lower() else url3 if isinstance(url3, str) and 'soundcloud' in url3.lower() else None
             patreon_url = url1 if isinstance(url1, str) and 'patreon' in url1.lower() else url2 if isinstance(url2, str) and 'patreon' in url2.lower() else url3 if isinstance(url3, str) and 'patreon' in url3.lower() else None
 
         matches = data[data.iloc[:, 2].apply(lambda x: bool(re.search(rf'\b{search_term}\b', str(x), re.IGNORECASE)))].values.tolist()
@@ -64,7 +60,7 @@ def process_blob(blob, search_term, folder_name):
         for match in matches:
             col4 = match[3] if len(match) > 3 else None
             col5 = match[4] if len(match) > 4 else None
-            matching_rows[blob.name].append((youtube_url, soundcloud_url, patreon_url, match[0], match[2], col4, col5))
+            matching_rows[blob.name].append((youtube_url, patreon_url, match[0], match[2], col4, col5))
 
     return matching_rows
 
@@ -97,8 +93,6 @@ bucket_name_mapping = {
 }
 display_names = list(bucket_name_mapping.keys())
 selected_display_name = st.selectbox("Select a feed:", display_names)
-#selected_display_name = st.radio("Select a feed:", display_names)#
-#above code is for using radio buttons instead of dropdown TBD which is better#
 bucket_name = bucket_name_mapping[selected_display_name]
 
 bucket = client.get_bucket(bucket_name)
@@ -107,16 +101,15 @@ unique_folder_names = sorted(set(os.path.dirname(blob.name) for blob in blobs if
 folder_names = {"All Miniseries": "all", **{os.path.basename(folder)[4:].replace('_', ' '): folder for folder in unique_folder_names if folder}}
 folder_name = st.selectbox("Select a Miniseries:", list(folder_names.keys()))
 
-search_term = st.text_input("Enter search term:", value="", key="search_box", max_chars=None, type="default", help=None, placeholder="e.g. Star Wars")
+search_term = st.text_input("Enter search term:", value="", key="search_box", max_chars=None, type="default", help=None, placeholder="e.g. Star Wars", on_change=lambda: st.session_state.update({'button_clicked': True}))
 highlight_color = "#E392EA"
-button_clicked = st.button("Search")
+button_clicked = st.button("Search") or st.session_state.get('button_clicked', False)
 
 def time_to_seconds(time_str):
     h, m, s = map(int, time_str.split(':'))
     return h * 3600 + m * 60 + s
 
 youtube_icon_url = "https://storage.googleapis.com/bcdb_images/Youtube_logo.png"
-soundcloud_icon_url = "https://storage.googleapis.com/bcdb_images/soundcloud_logo.png"
 patreon_icon_url = "https://storage.googleapis.com/bcdb_images/patreon_logo.png"
 
 def get_image_url(bucket, file_name):
@@ -147,6 +140,7 @@ def extract_number(file_name):
 image_bucket = client.get_bucket('bcdb_images')
 
 if st.button('Reset', type="primary"):
+    st.session_state['button_clicked'] = False
     st.experimental_rerun()
 
 if button_clicked:
@@ -170,6 +164,9 @@ if button_clicked:
                 file_name_only = os.path.basename(file_name_without_ext)[4:].replace('_', ' ')
                 result_word = "result" if len(file_results) == 1 else "results"
 
+                patreon_url = next((result[1] for result in file_results if result[1]), None)
+                patreon_icon = f'<a href="{patreon_url}" target="_blank"><img src="{patreon_icon_url}" width="20"></a>' if patreon_url else ""
+
                 if folder_name == "All Miniseries":
                     image_url = get_image_url(image_bucket, file_name)
                     if image_url:
@@ -181,17 +178,9 @@ if button_clicked:
                     public_url = f'https://storage.googleapis.com/{bucket_name}/{file_name}'
                     view_button = f'<a href="{public_url}" target="_blank">View</a>'
 
-                    if any(result[2] for result in file_results) and not patreon_icon_displayed:
-                        patreon_url = next(result[2] for result in file_results if result[2])
-                        patreon_link = f"{patreon_url}"
-                        patreon_icon = f'<a href="{patreon_link}" target="_blank"><img src="{patreon_icon_url}" width="20"></a>'
-                        patreon_icon_displayed = True
-                    else:
-                        patreon_icon = ""
-
                     st.markdown(f"<span style='font-size: 25px; color: #AE88E1; font-weight: bold;'>{patreon_icon} {file_name_only} <span style='font-size: 15pt; color: #8E3497;'>({len(file_results)} {result_word})</span>:</span><br>Transcript:  {view_button} | {download_button}", unsafe_allow_html=True)
 
-                for youtube_url, soundcloud_url, patreon_url, col1, col3, col4, col5 in file_results:
+                for youtube_url, patreon_url, col1, col3, col4, col5 in file_results:
                     if pd.notna(col5):
                         st.markdown(f'<div style="margin-bottom: 2px;"><span style="color: #8E3497; font-weight: bold;">[{col1}]:</span> <span style="color: red;">{highlight_term(col3, search_term)}</span></div>', unsafe_allow_html=True)
                     else:
@@ -199,20 +188,10 @@ if button_clicked:
 
                     time_in_seconds = time_to_seconds(col1)
                     youtube_icon = f'<a href="{youtube_url}&t={time_in_seconds}" target="_blank"><img src="{youtube_icon_url}" width="30"></a>' if youtube_url else ""
-                    soundcloud_icon = f'<a href="{soundcloud_url}#t={time_in_seconds}" target="_blank"><img src="{soundcloud_icon_url}" width="20"></a>' if soundcloud_url else ""
-                    patreon_icon = f'<a href="{patreon_url}" target="_blank"><img src="{patreon_icon_url}" width="20"></a>' if patreon_url else ""
-
-                    if any(result[2] for result in file_results) and not patreon_icon_displayed:
-                        patreon_url = next(result[2] for result in file_results if result[2])
-                        patreon_link = f"{patreon_url}"
-                        patreon_icon = f'<a href="{patreon_link}" target="_blank"><img src="{patreon_icon_url}" width="20"></a>'
-                        patreon_icon_displayed = True
-                    else:
-                        patreon_icon = ""
 
                     movie_info = f'<span style="color: #FF424D; font-weight: bold;">Movie Timecode:</span> {col4}' if pd.notna(col4) else ""
 
-                    combined_html = f'{youtube_icon} {soundcloud_icon} {patreon_icon} {movie_info}'
+                    combined_html = f'{youtube_icon} {movie_info}'
 
                     st.markdown(combined_html, unsafe_allow_html=True)
 
@@ -228,11 +207,8 @@ st.markdown(
 google_form_text = "This buffoonery is not officially sanctioned by the <a href='https://www.blankcheckpod.com'>Blank Check</a> podcast."
 st.markdown(f'<div style="text-align: center; font-size: 12px;">{google_form_text}</div>', unsafe_allow_html=True)
 
-twitter_icon_url = "https://storage.googleapis.com/bcdb_images/twitter_logo.png"
-twitter_page_url = "https://twitter.com/blankcheckdb"
-
-footer_text = "<a href='https://www.youtube.com/watch?v=MNLTgUZ8do4&t=3928s'>Beta</a> build March 21, 2024"
+footer_text = "For inquiries, email us at <a href='mailto:blankcheckdb@gmail.com'>blankcheckdb@gmail.com</a>"
 st.write(f'<div style="text-align: center;font-size: 12px;">{footer_text}</div>', unsafe_allow_html=True)
 
-twitter_icon_link = f'<a href="{twitter_page_url}" target="_blank"><img src="{twitter_icon_url}" width="30"></a>'
-st.markdown(f'<div style="text-align: center;font-size: 12px;">{twitter_icon_link}</div>', unsafe_allow_html=True)
+footer_text = "<a href='https://www.youtube.com/watch?v=MNLTgUZ8do4&t=3928s'>Beta</a> build December 23, 2024"
+st.write(f'<div style="text-align: center;font-size: 12px;">{footer_text}</div>', unsafe_allow_html=True)
