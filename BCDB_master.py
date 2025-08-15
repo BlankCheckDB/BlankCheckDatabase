@@ -425,14 +425,14 @@ with c3:
     url = st.session_state.get("random_url")
     if url:
         try:
-            st.link_button("▶ Open random episode", url, use_container_width=True)
+            st.link_button("▶ Play random episode", url, use_container_width=True)
         except Exception:
             st.markdown(
-                f'<a href="{url}" target="_blank" rel="noopener">▶ Open random episode</a>',
+                f'<a href="{url}" target="_blank" rel="noopener">▶ Play random episode</a>',
                 unsafe_allow_html=True,
             )
     else:
-        st.button("▶ Open random episode", disabled=True, help="No YouTube link found", use_container_width=True)
+        st.button("▶ Play random episode", disabled=True, help="No YouTube link found", use_container_width=True)
 
 run_search = search_clicked or st.session_state.get('button_clicked', False)
 
