@@ -1,14 +1,21 @@
 import os
 import re
-import streamlit as st
-from google.oauth2 import service_account
-from google.cloud import storage
 import base64
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import csv
-import pandas as pd
-from collections import defaultdict
+import math
 from io import StringIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
+
+import pandas as pd
+import streamlit as st
+from google.cloud import storage
+from google.oauth2 import service_account
+
+import random
+import streamlit.components.v1 as components
+
+from datetime import datetime, timezone, timedelta
+import uuid, json
 
 credentials = service_account.Credentials.from_service_account_info(
     st.secrets["gcp_service_account"]
@@ -17,198 +24,522 @@ client = storage.Client(credentials=credentials)
 
 st.set_page_config(page_title="Blank Check Database", page_icon=":mag_right:")
 
-if 'reset' not in st.session_state:
-    st.session_state['reset'] = False
-if 'button_clicked' not in st.session_state:
-    st.session_state['button_clicked'] = False
+LOG_BUCKET = "bcdb_testing"
+RAW_LOG_PREFIX = "logs/searches/raw"
+AGG_PREFIX = "logs/searches/aggregated"
+AUTO_AGGREGATE_EVERY_MINUTES = 60
 
-def download_csv(data_frame, file_name):
-    csv_buffer = StringIO()
-    data_frame.to_csv(csv_buffer, sep=";", index=False)
-    b64 = base64.b64encode(csv_buffer.getvalue().encode()).decode()
-    href = f'<a href="data:file/csv;base64,{b64}" download="{file_name}" target="_blank">Download</a>'
-    return href
+SOUND_TRIGGERS = [
+    {
+        "id": "uk",
+        "patterns": [r"\blondon\b", r"\bengland\b", r"\bgreat britain\b", r"\buk\b"],
+        "url": "https://storage.cloud.google.com/bcdb_audio/big_ben_chimes.mp3",
+        "type": "regex_any",
+    },
+    {
+         "id": "twisted",
+         "patterns": [r"\btwisted\b"],
+         "url": "https://storage.cloud.google.com/bcdb_audio/twisted.mp3",
+         "type": "regex_any",
+    },
+    {
+         "id": "unbreakable",
+         "patterns": [r"\bunbreakable\b"],
+         "url": "https://storage.cloud.google.com/bcdb_audio/unbreakable.mp3",
+         "type": "regex_any",
+    },    
+    {
+         "id": "comedy_point",
+         "patterns": [r"\bcomedy points\b"],
+         "url": "https://storage.cloud.google.com/bcdb_audio/comedy_point.mp3",
+         "type": "regex_any",
+    },
+]
+
+for trig in SOUND_TRIGGERS:
+    if trig.get("type", "regex_any").startswith("regex"):
+        trig["_compiled"] = [re.compile(p, re.IGNORECASE) for p in trig["patterns"]]
+
+def _first_matching_trigger(term: str):
+    t = term.strip()
+    tl = t.lower()
+    for trig in SOUND_TRIGGERS:
+        mtype = trig.get("type", "regex_any")
+        if mtype == "regex_any":
+            if any(rx.search(t) for rx in trig["_compiled"]):
+                return trig
+        elif mtype == "exact":
+            if any(tl == p.lower() for p in trig["patterns"]):
+                return trig
+        elif mtype == "substring_any":
+            if any(p.lower() in tl for p in trig["patterns"]):
+                return trig
+    return None
+
+def _play_sound_once_per_term(trigger_id: str, term: str, sound_url: str):
+    key = f"{trigger_id}::{term.lower()}"
+    already = st.session_state.get("played_sounds", [])
+    aset = set(already)
+    if key in aset:
+        return
+    components.html(
+        f"""
+        <audio autoplay>
+            <source src="{sound_url}">
+            Your browser does not support the audio element.
+        </audio>
+        """,
+        height=0,
+    )
+    aset.add(key)
+    st.session_state["played_sounds"] = list(aset)
+
+@st.cache_resource
+def get_gcs_client():
+    return storage.Client(credentials=credentials)
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def list_csv_blobs(bucket_name: str, prefix: str | None):
+    client = get_gcs_client()
+    bucket = client.bucket(bucket_name)
+    return [b.name for b in bucket.list_blobs(prefix=prefix) if b.name.lower().endswith('.csv')]
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def list_all_miniseries(bucket_name: str):
+    names = list_csv_blobs(bucket_name, prefix=None)
+    folders = sorted({os.path.dirname(n) for n in names if os.path.dirname(n)})
+    mapping = { (os.path.basename(f)[4:].replace('_',' ')): f for f in folders }
+    return {"All Miniseries": "all", **mapping}
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def cached_image_url(bucket_name: str, file_name: str):
+    client = get_gcs_client()
+    bucket = client.bucket('bcdb_images') if bucket_name != 'bcdb_images' else client.bucket(bucket_name)
+    stem = os.path.splitext(os.path.basename(file_name))[0]
+    guess_paths = [
+        f"episode_art/{stem}.jpg",
+        f"episode_art/{stem}.jpeg",
+        f"episode_art/{stem}.png",
+        f"episode_art/{stem}.gif",
+    ]
+    for gp in guess_paths:
+        blob = bucket.blob(gp)
+        if blob.exists(client):
+            return f"https://storage.googleapis.com/{bucket.name}/{gp}"
+    folder_name = os.path.basename(os.path.dirname(file_name))
+    for b in bucket.list_blobs(prefix=f"episode_art/{folder_name}"):
+        if b.name.lower().endswith(('.jpg','.jpeg','.png','.gif')):
+            return f"https://storage.googleapis.com/{bucket.name}/{b.name}"
+    return None
+
+def get_youtube_url_for_blob(bucket_name: str, blob_name: str) -> str | None:
+    client = get_gcs_client()
+    blob = client.bucket(bucket_name).blob(blob_name)
+    try:
+        head = pd.read_csv(
+            blob.open("rt"),
+            sep=";",
+            engine="c",
+            dtype=str,
+            nrows=3,
+            header=None,
+            on_bad_lines="skip",
+        )
+    except Exception:
+        return None
+    head0 = head.iloc[:, 0].astype(str).tolist() + ["", "", ""]
+    youtube, _ = _first_urls_from_head0(head0)
+    return youtube
+
+def _get_session_id() -> str:
+    if "session_id" not in st.session_state:
+        st.session_state["session_id"] = str(uuid.uuid4())
+    return st.session_state["session_id"]
+
+def log_search_event(term: str, feed: str, folder: str, results_count: int):
+    try:
+        client = get_gcs_client()
+        bucket = client.bucket(LOG_BUCKET)
+
+        now = datetime.now(timezone.utc)
+        date_path = now.strftime("%Y/%m/%d")
+        payload = {
+            "ts": now.isoformat(),
+            "session_id": _get_session_id(),
+            "feed": feed,
+            "folder": folder,
+            "term": term,
+            "results_count": int(results_count),
+        }
+        blob_name = f"{RAW_LOG_PREFIX}/{date_path}/{now.strftime('%H%M%S')}_{uuid.uuid4().hex}.json"
+        bucket.blob(blob_name).upload_from_string(json.dumps(payload) + "\n", content_type="application/json")
+    except Exception as e:
+        print(f"[search logging skipped] {e}")
+
+def aggregate_day_to_csv(target_date=None):
+    try:
+        client = get_gcs_client()
+        bucket = client.bucket(LOG_BUCKET)
+        if target_date is None:
+            target_date = datetime.now(timezone.utc).date()
+        prefix = f"{RAW_LOG_PREFIX}/{target_date.strftime('%Y/%m/%d')}/"
+
+        rows = []
+        for b in bucket.list_blobs(prefix=prefix):
+            if b.name.endswith(".json"):
+                try:
+                    rows.append(json.loads(b.download_as_text()))
+                except Exception:
+                    pass
+
+        if not rows:
+            return None
+
+        df = pd.DataFrame(rows)
+        if "ts" in df.columns:
+            df["ts_utc"] = pd.to_datetime(df["ts"], utc=True)
+            df["date"] = df["ts_utc"].dt.date.astype(str)
+            df["hour_utc"] = df["ts_utc"].dt.strftime("%H")
+
+        out_blob = bucket.blob(f"{AGG_PREFIX}/{target_date.strftime('%Y-%m-%d')}/searches-{target_date.strftime('%Y-%m-%d')}.csv")
+        tmp = "/tmp/searches_today.csv"
+        df.to_csv(tmp, index=False)
+        out_blob.upload_from_filename(tmp, content_type="text/csv")
+        return f"https://storage.googleapis.com/{out_blob.bucket.name}/{out_blob.name}"
+    except Exception as e:
+        print(f"[aggregate failed] {e}")
+        return None
+
+def maybe_auto_aggregate():
+    try:
+        now = datetime.now(timezone.utc)
+        last = st.session_state.get("last_agg_ts")
+        if (last is None) or ((now - last) >= timedelta(minutes=AUTO_AGGREGATE_EVERY_MINUTES)):
+            url = aggregate_day_to_csv(now.date())
+            st.session_state["last_agg_ts"] = now
+            if url:
+                st.info(f"Updated today’s search CSV. [Open CSV]({url})")
+    except Exception:
+        pass
 
 term_styles = {
     'comedy points': {'color': '#D4AF37', 'emoji': ''},
     'night eggs': {'color': '#AE88E1', 'emoji': '🥚'},
     'river of ham': {'color': '#AE88E1', 'emoji': '🐷'},
     'david dog': {'color': '#AE88E1', 'emoji': '🐶'},
-    'burger report': {'color': '#AE88E1', 'emoji': '🍔'}
+    'London': {'color': '#AE88E1', 'emoji': '🇬🇧'},
+    'England': {'color': '#AE88E1', 'emoji': '🇬🇧'},
+    'Great Britain': {'color': '#AE88E1', 'emoji': '🇬🇧'},
+    'burger report': {'color': '#AE88E1', 'emoji': '🍔'},
 }
 
-def highlight_term(text, term):
-    def replace(match):
-        matched_text = match.group(0)
-        style = term_styles.get(term.lower(), {'color': '#AE88E1', 'emoji': ''})
-        return f'<span style="font-weight: bold; color: {style["color"]};">{matched_text}{style["emoji"]}</span>'
-    return re.sub(rf'\b{re.escape(term)}\b', replace, text, flags=re.IGNORECASE)
+def highlight_term_html(text: str, pattern: re.Pattern, raw_term_for_style: str) -> str:
+    style = term_styles.get(raw_term_for_style.lower(), {'color': '#AE88E1', 'emoji': ''})
+    color = style['color']
+    emoji = style['emoji']
+    def repl(m: re.Match):
+        return f'<span style="font-weight:bold;color:{color};">{m.group(0)}{emoji}</span>'
+    return pattern.sub(repl, text)
 
-def process_blob(blob, search_term, folder_name):
-    matching_rows = defaultdict(list)
+YOUTUBE_ICON = "https://storage.googleapis.com/bcdb_images/Youtube_logo.png"
+PATREON_ICON = "https://storage.googleapis.com/bcdb_images/patreon_logo.png"
+LOGO_URL = "https://storage.googleapis.com/bcdb_images/BCDb_logo_2025.png"
 
-    if blob.name.endswith('.csv') and (folder_name == "all" or blob.name.startswith(folder_name)):
-        data = pd.read_csv(blob.open("rt"), delimiter=";", engine="python")
+def _first_urls_from_head0(head0: list[str]):
+    youtube = next((u for u in head0 if isinstance(u, str) and 'youtube' in u.lower()), None)
+    patreon = next((u for u in head0 if isinstance(u, str) and 'patreon' in u.lower()), None)
+    return youtube, patreon
 
-        if not data.empty:
-            url1, url2, url3 = data.iloc[0, 0], data.iloc[1, 0], data.iloc[2, 0]
-            youtube_url = url1 if isinstance(url1, str) and 'youtube' in url1.lower() else url2 if isinstance(url2, str) and 'youtube' in url2.lower() else url3 if isinstance(url3, str) and 'youtube' in url3.lower() else None
-            patreon_url = url1 if isinstance(url1, str) and 'patreon' in url1.lower() else url2 if isinstance(url2, str) and 'patreon' in url2.lower() else url3 if isinstance(url3, str) and 'patreon' in url3.lower() else None
+def scan_csv_for_matches(blob: storage.Blob, pattern: re.Pattern):
+    out = []
+    head_done = False
+    youtube = patreon = None
+    for chunk in pd.read_csv(
+        blob.open("rt"),
+        sep=";",
+        engine="c",
+        dtype=str,
+        chunksize=50_000,
+        header=None,
+        on_bad_lines='skip'
+    ):
+        chunk = chunk.fillna('')
+        if not head_done and not chunk.empty:
+            head0 = chunk.iloc[:3, 0].astype(str).tolist() + ['', '', '']
+            youtube, patreon = _first_urls_from_head0(head0)
+            head_done = True
+        if chunk.shape[1] < 3:
+            continue
+        mask = chunk.iloc[:, 2].astype(str).str.contains(pattern, na=False)
+        if not mask.any():
+            continue
+        for _, row in chunk.loc[mask].iterrows():
+            tc = row.iloc[0] if len(row) > 0 else ''
+            line = row.iloc[2] if len(row) > 2 else ''
+            movie_time = row.iloc[3] if len(row) > 3 else ''
+            red_flag = row.iloc[4] if len(row) > 4 else ''
+            out.append((youtube, patreon, tc, line, movie_time, red_flag))
+    return out
 
-        matches = data[data.iloc[:, 2].apply(lambda x: bool(re.search(rf'\b{search_term}\b', str(x), re.IGNORECASE)))].values.tolist()
+@st.cache_data(show_spinner=False, ttl=600)
+def searching(bucket_name: str, search_term: str, folder_path: str):
+    if not search_term:
+        return {}
+    client = get_gcs_client()
+    bucket = client.bucket(bucket_name)
+    names = list_csv_blobs(bucket_name, None if folder_path == 'all' else folder_path)
+    if not names:
+        return {}
+    pattern = re.compile(rf"\b{re.escape(search_term)}\b", re.IGNORECASE)
+    results: dict[str, list[tuple]] = {}
+    max_workers = min(32, max(1, len(names)))
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_to_name = {ex.submit(scan_csv_for_matches, bucket.blob(n), pattern): n for n in names}
+        for fut in as_completed(future_to_name):
+            name = future_to_name[fut]
+            rows = fut.result()
+            if rows:
+                results[name] = rows
+    return results
 
-        for match in matches:
-            col4 = match[3] if len(match) > 3 else None
-            col5 = match[4] if len(match) > 4 else None
-            matching_rows[blob.name].append((youtube_url, patreon_url, match[0], match[2], col4, col5))
+def extract_number(file_name: str):
+    m = re.search(r"\d+", file_name)
+    return int(m.group()) if m else float('inf')
 
-    return matching_rows
+def time_to_seconds(time_str: str) -> int:
+    try:
+        h, m, s = map(int, time_str.split(':'))
+        return h * 3600 + m * 60 + s
+    except Exception:
+        return 0
 
-def get_csv_data(bucket, search_term, folder_name):
-    matching_rows = defaultdict(list)
-    blobs = list(bucket.list_blobs())
+def build_view_and_download_links(bucket_name: str, blob_name: str):
+    public_url = f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
+    view_btn = f'<a href="{public_url}" target="_blank">View</a>'
+    download_btn = f'<a href="{public_url}" download target="_blank">Download</a>'
+    return view_btn, download_btn
 
-    with ThreadPoolExecutor() as executor:
-        results = executor.map(process_blob, blobs, [search_term]*len(blobs), [folder_name]*len(blobs))
-
-        for result in results:
-            matching_rows.update(result)
-
-    return matching_rows
-
-def get_csv_dataframe(bucket, file_name):
-    for blob in bucket.list_blobs():
-        if blob.name == file_name:
-            data = pd.read_csv(blob.open("rt"), delimiter=";", engine="python")
-            return data
-    return None
-
-logo_url = f"https://storage.googleapis.com/bcdb_images/BCDb_logo_apr10.png"
-st.markdown(f'<div style="text-align: center;"><img src="{logo_url}" width="300"></div>', unsafe_allow_html=True)
-st.markdown("<h1 style='text-align: center;'><span style='color: #AE88E1;'>Blank Check </span><span style='color: #8E3497;'>Database</span></h1>", unsafe_allow_html=True)
+st.markdown(f'<div style="text-align:center;"><img src="{LOGO_URL}" width="300"></div>', unsafe_allow_html=True)
+st.markdown("<h1 style='text-align:center;'><span style='color:#AE88E1;'>Blank Check </span><span style='color:#8E3497;'>Database</span></h1>", unsafe_allow_html=True)
 
 bucket_name_mapping = {
     'Main Feed': 'bcdb_episodes',
     'Patreon': 'bcdb_patreon',
 }
-display_names = list(bucket_name_mapping.keys())
-selected_display_name = st.selectbox("Select a feed:", display_names)
-bucket_name = bucket_name_mapping[selected_display_name]
 
-bucket = client.get_bucket(bucket_name)
-blobs = bucket.list_blobs()
-unique_folder_names = sorted(set(os.path.dirname(blob.name) for blob in blobs if blob.name.endswith(('.csv'))))
-folder_names = {"All Miniseries": "all", **{os.path.basename(folder)[4:].replace('_', ' '): folder for folder in unique_folder_names if folder}}
-folder_name = st.selectbox("Select a Miniseries:", list(folder_names.keys()))
+try:
+    feed = st.segmented_control(
+        "Select feed:",
+        options=list(bucket_name_mapping.keys()),
+        selection_mode="single",
+        default="Main Feed",
+    )
+except Exception:
+    feed = st.radio(
+        "Select feed:",
+        options=list(bucket_name_mapping.keys()),
+        horizontal=True,
+        index=0,
+    )
 
-search_term = st.text_input("Enter search term:", value="", key="search_box", max_chars=None, type="default", help=None, placeholder="e.g. Star Wars", on_change=lambda: st.session_state.update({'button_clicked': True}))
-highlight_color = "#E392EA"
-button_clicked = st.button("Search") or st.session_state.get('button_clicked', False)
+bucket_name = bucket_name_mapping[feed]
 
-def time_to_seconds(time_str):
-    h, m, s = map(int, time_str.split(':'))
-    return h * 3600 + m * 60 + s
+maybe_auto_aggregate()
 
-youtube_icon_url = "https://storage.googleapis.com/bcdb_images/Youtube_logo.png"
-patreon_icon_url = "https://storage.googleapis.com/bcdb_images/patreon_logo.png"
+folder_names = list_all_miniseries(bucket_name)
+folder_choice = st.selectbox("Select a Miniseries:", list(folder_names.keys()))
+folder_path = folder_names[folder_choice]
 
-def get_image_url(bucket, file_name):
-    image_url = None
-
-    file_name_without_ext, _ = os.path.splitext(file_name)
-    file_name_only = os.path.basename(file_name_without_ext)
-    folder_name = os.path.basename(os.path.dirname(file_name))
-
-    prefix = f"episode_art/{file_name_only}"
-    for blob in bucket.list_blobs(prefix=prefix):
-        if blob.name.endswith(('.jpg', '.jpeg', '.png', '.gif')):
-            image_url = f"https://storage.googleapis.com/{bucket.name}/{blob.name}"
-            return image_url
-
-    prefix = f"episode_art/{folder_name}"
-    for blob in bucket.list_blobs(prefix=prefix):
-        if blob.name.endswith(('.jpg', '.jpeg', '.png', '.gif')):
-            image_url = f"https://storage.googleapis.com/{bucket.name}/{blob.name}"
-            return image_url
-
-    return image_url
-
-def extract_number(file_name):
-    match = re.search(r'\d+', file_name)
-    return int(match.group()) if match else float('inf')
-
-image_bucket = client.get_bucket('bcdb_images')
-
-if st.button('Reset', type="primary"):
+if 'button_clicked' not in st.session_state:
     st.session_state['button_clicked'] = False
-    st.experimental_rerun()
+if 'page' not in st.session_state:
+    st.session_state['page'] = 1
+if 'played_sounds' not in st.session_state:
+    st.session_state['played_sounds'] = []
 
-if button_clicked:
-    if not search_term.strip():
-        st.write("Please enter a search term")
-    else:
+def _trigger_search():
+    st.session_state['button_clicked'] = True
+    st.session_state['page'] = 1
 
-        folder_path = folder_names[folder_name]
-        results = get_csv_data(bucket, search_term, folder_path)
+PLACEHOLDER_OPTIONS = [
+    "e.g. Star Wars",
+    "e.g. Beta Cuck Movement",
+    "e.g. Big Chicago",
+    "e.g. Chip Smith",
+    "e.g. Retired Bit",
+    "e.g. Watto",
+    "e.g. Owns bones",
+    "e.g. Night Eggs",
+    "e.g. Hello, Fennel",
+    "e.g. Buried Jeans",
+    "e.g. Burger Report",  
+    "e.g. Humblebrag", 
+    "e.g. BLANK IT",  
+    "e.g. Sully",  
+    "e.g. Wild Hogs",  
+    "e.g. Blarp",  
+    "e.g. Boss Baby",
+    "e.g. Box office game",    
+    "e.g. Decade of dreams", 
+]
 
-        if results:
-            total_results = sum(len(file_results) for file_results in results.values())
-            st.write(f"({total_results}) {'result' if total_results == 1 else 'results'} found")
+if "search_placeholder" not in st.session_state:
+    st.session_state["search_placeholder"] = random.choice(PLACEHOLDER_OPTIONS)
 
-            sorted_results = sorted(results.items(), key=lambda x: (x[0].rsplit('/', 1)[-1], extract_number(x[0])))
+if "search_box" not in st.session_state:
+    st.session_state["search_box"] = ""
 
-            for index, (file_name, file_results) in enumerate(sorted_results):
-                patreon_icon_displayed = False
-                file_name_without_ext, _ = os.path.splitext(file_name)
-                file_folder = os.path.dirname(file_name)
-                file_name_only = os.path.basename(file_name_without_ext)[4:].replace('_', ' ')
-                result_word = "result" if len(file_results) == 1 else "results"
-
-                patreon_url = next((result[1] for result in file_results if result[1]), None)
-                patreon_icon = f'<a href="{patreon_url}" target="_blank"><img src="{patreon_icon_url}" width="20"></a>' if patreon_url else ""
-
-                if folder_name == "All Miniseries":
-                    image_url = get_image_url(image_bucket, file_name)
-                    if image_url:
-                        st.markdown(f'<div style="text-align: left;"><img src="{image_url}" width="200"></div>', unsafe_allow_html=True)
-
-                data_frame = get_csv_dataframe(bucket, file_name)
-                if data_frame is not None:
-                    download_button = download_csv(data_frame, file_name)
-                    public_url = f'https://storage.googleapis.com/{bucket_name}/{file_name}'
-                    view_button = f'<a href="{public_url}" target="_blank">View</a>'
-
-                    st.markdown(f"<span style='font-size: 25px; color: #AE88E1; font-weight: bold;'>{patreon_icon} {file_name_only} <span style='font-size: 15pt; color: #8E3497;'>({len(file_results)} {result_word})</span>:</span><br>Transcript:  {view_button} | {download_button}", unsafe_allow_html=True)
-
-                for youtube_url, patreon_url, col1, col3, col4, col5 in file_results:
-                    if pd.notna(col5):
-                        st.markdown(f'<div style="margin-bottom: 2px;"><span style="color: #8E3497; font-weight: bold;">[{col1}]:</span> <span style="color: red;">{highlight_term(col3, search_term)}</span></div>', unsafe_allow_html=True)
-                    else:
-                        st.markdown(f'<div style="margin-bottom: 2px;"><span style="color: #8E3497; font-weight: bold;">[{col1}]:</span> {highlight_term(col3, search_term)}</div>', unsafe_allow_html=True)
-
-                    time_in_seconds = time_to_seconds(col1)
-                    youtube_icon = f'<a href="{youtube_url}&t={time_in_seconds}" target="_blank"><img src="{youtube_icon_url}" width="30"></a>' if youtube_url else ""
-
-                    movie_info = f'<span style="color: #FF424D; font-weight: bold;">Movie Timecode:</span> {col4}' if pd.notna(col4) else ""
-
-                    combined_html = f'{youtube_icon} {movie_info}'
-
-                    st.markdown(combined_html, unsafe_allow_html=True)
-
-                st.write("---")
-        else:
-            st.write("No bits found.")
-
-st.markdown(
-    "<h1 style='text-align: center; font-size: 16pt;'>TIP: For faster searching, choose a miniseries first.</h1>",
-    unsafe_allow_html=True
+search_term = st.text_input(
+    "Enter search term:",
+    key="search_box",
+    placeholder=st.session_state["search_placeholder"],
+    on_change=_trigger_search,
 )
 
-google_form_text = "This buffoonery is not officially sanctioned by the <a href='https://www.blankcheckpod.com'>Blank Check</a> podcast."
-st.markdown(f'<div style="text-align: center; font-size: 12px;">{google_form_text}</div>', unsafe_allow_html=True)
+c1, c2, c3 = st.columns(3)
+with c1:
+    search_clicked = st.button("Search", use_container_width=True)
+with c2:
+    reset_clicked = st.button("Reset", type="primary", use_container_width=True)
+with c3:
+    random_clicked = st.button("Play Random Episode 🎲", use_container_width=True)
 
-footer_text = "For inquiries, email us at <a href='mailto:blankcheckdb@gmail.com'>blankcheckdb@gmail.com</a>"
-st.write(f'<div style="text-align: center;font-size: 12px;">{footer_text}</div>', unsafe_allow_html=True)
+run_search = search_clicked or st.session_state.get('button_clicked', False)
 
-footer_text = "<a href='https://www.youtube.com/watch?v=MNLTgUZ8do4&t=3928s'>Beta</a> build December 23, 2024"
-st.write(f'<div style="text-align: center;font-size: 12px;">{footer_text}</div>', unsafe_allow_html=True)
+if reset_clicked:
+    st.session_state['button_clicked'] = False
+    st.session_state['page'] = 1
+    st.rerun()
+
+if random_clicked:
+    names = list_csv_blobs(bucket_name, None if folder_path == "all" else folder_path)
+    if not names:
+        st.warning("No episodes available.")
+    else:
+        yt_url = None
+        attempts = min(20, len(names))
+        for _ in range(attempts):
+            candidate = random.choice(names)
+            yt_url = get_youtube_url_for_blob(bucket_name, candidate)
+            if yt_url:
+                break
+        if yt_url:
+            components.html(f"<script>window.open('{yt_url}', '_blank');</script>", height=0)
+        else:
+            st.warning("Couldn't find a YouTube link in the sampled episodes.")
+
+if run_search:
+    term = search_term.strip()
+
+    matched = _first_matching_trigger(term)
+    if matched:
+        _play_sound_once_per_term(matched["id"], term, matched["url"])
+
+    if not term:
+        st.write("Please enter a search term")
+    else:
+        with st.spinner("Searching episodes…"):
+            results = searching(bucket_name, term, folder_path)
+
+        total = sum(len(v) for v in results.values()) if results else 0
+        log_search_event(term=term, feed=feed, folder=folder_choice, results_count=total)
+
+        if not results:
+            st.write("No bits found.")
+        else:
+            st.write(f"({total}) {'result' if total == 1 else 'results'} found")
+
+            sorted_items = sorted(results.items(), key=lambda x: (x[0].rsplit('/',1)[-1], extract_number(x[0])))
+            compiled = re.compile(rf"\b{re.escape(term)}\b", re.IGNORECASE)
+
+            total_files = len(sorted_items)
+            page_size = 20
+            total_pages = max(1, math.ceil(total_files / page_size))
+            st.session_state['page'] = max(1, min(st.session_state.get('page', 1), total_pages))
+
+            start = (st.session_state['page'] - 1) * page_size
+            end = start + page_size
+            page_items = sorted_items[start:end]
+
+            col_prev, col_info, col_next = st.columns([1, 2, 1])
+            with col_prev:
+                if st.button("◀ Prev", disabled=st.session_state['page'] <= 1, key="prev_btn"):
+                    st.session_state['page'] -= 1
+                    st.rerun()
+            with col_info:
+                st.markdown(
+                    f"<div style='text-align:center;'>Page {st.session_state['page']} of {total_pages} &nbsp;•&nbsp; "
+                    f"Showing files {start+1}-{min(end, total_files)} of {total_files}</div>",
+                    unsafe_allow_html=True
+                )
+            with col_next:
+                if st.button("Next ▶", disabled=st.session_state['page'] >= total_pages, key="next_btn"):
+                    st.session_state['page'] += 1
+                    st.rerun()
+
+            for file_name, rows in page_items:
+                file_title = os.path.basename(os.path.splitext(file_name)[0])[4:].replace('_',' ')
+                view_btn, download_btn = build_view_and_download_links(bucket_name, file_name)
+
+                if folder_choice == "All Miniseries":
+                    img_url = cached_image_url('bcdb_images', file_name)
+                    if img_url:
+                        st.markdown(f'<div style="text-align:left;"><img src="{img_url}" width="200"></div>', unsafe_allow_html=True)
+
+                patreon_url_any = next((r[1] for r in rows if r[1]), None)
+                patreon_html = f'<a href="{patreon_url_any}" target="_blank"><img src="{PATREON_ICON}" width="20"></a>' if patreon_url_any else ''
+                header_html = (
+                    f"<span style='font-size:25px;color:#AE88E1;font-weight:bold;'>{patreon_html} {file_title} "
+                    f"<span style='font-size:15pt;color:#8E3497;'>({len(rows)} {'result' if len(rows)==1 else 'results'})</span>:</span><br>"
+                    f"Transcript: {view_btn} | {download_btn}"
+                )
+                st.markdown(header_html, unsafe_allow_html=True)
+
+                with st.expander(f"Matches: {len(rows)}", expanded=True):
+                    parts = []
+                    for (youtube_url, patreon_url, timecode, line, movie_time, red_flag) in rows:
+                        compiled_term = re.compile(rf"\b{re.escape(term)}\b", re.IGNORECASE)
+                        line_html = highlight_term_html(line, compiled_term, term)
+                        tsec = time_to_seconds(timecode)
+                        yt_icon = f'<a href="{youtube_url}&t={tsec}" target="_blank"><img src="{YOUTUBE_ICON}" width="20" style="vertical-align:middle;"></a>' if youtube_url else ''
+
+                        tc_html = f"<span style=\"color:#8E3497;font-weight:bold;\">[{timecode}]:</span>"
+
+                        line_block = f"<div style=\"margin-bottom:6px;\">{yt_icon} {tc_html} "
+                        if isinstance(red_flag, str) and red_flag.strip():
+                            line_block += f"<span style=\"color:red;\">{line_html}</span>"
+                        else:
+                            line_block += f"{line_html}"
+                        line_block += "</div>"
+
+                        movie_info = f'<span style=\"color:#FF424D;font-weight:bold;\">Movie Timecode:</span> {movie_time}' if isinstance(movie_time, str) and movie_time.strip() else ''
+                        if movie_info:
+                            line_block += f"<div>{movie_info}</div>"
+
+                        parts.append(line_block)
+                    st.markdown("".join(parts), unsafe_allow_html=True)
+
+                st.write("---")
+
+            col_prev2, col_info2, col_next2 = st.columns([1, 2, 1])
+            with col_prev2:
+                if st.button("◀ Prev", disabled=st.session_state['page'] <= 1, key="prev_btn_bottom"):
+                    st.session_state['page'] -= 1
+                    st.rerun()
+            with col_info2:
+                st.markdown(f"<div style='text-align:center;'>Page {st.session_state['page']} of {total_pages}</div>", unsafe_allow_html=True)
+            with col_next2:
+                if st.button("Next ▶", disabled=st.session_state['page'] >= total_pages, key="next_btn_bottom"):
+                    st.session_state['page'] += 1
+                    st.rerun()
+
+st.markdown(
+    "<h1 style='text-align:center;font-size:16pt;'>TIP: For faster searching, choose a miniseries first.</h1>",
+    unsafe_allow_html=True,
+)
+
+info_text = "This buffoonery is not officially sanctioned by the <a href='https://www.blankcheckpod.com'>Blank Check</a> podcast."
+st.markdown(f'<div style=\"text-align:center;font-size:12px;\">{info_text}</div>', unsafe_allow_html=True)
+
+footer_text = "<a href='https://www.youtube.com/watch?v=MNLTgUZ8do4&t=3928s'>Beta</a> build August 2025"
+st.write(f'<div style=\"text-align:center;font-size:12px;\">{footer_text}</div>', unsafe_allow_html=True)
