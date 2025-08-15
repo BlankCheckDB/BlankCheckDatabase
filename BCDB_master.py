@@ -33,25 +33,25 @@ SOUND_TRIGGERS = [
     {
         "id": "uk",
         "patterns": [r"\blondon\b", r"\bengland\b", r"\bgreat britain\b", r"\buk\b"],
-        "url": "https://storage.cloud.google.com/bcdb_audio/big_ben_chimes.mp3",
+        "url": "https://storage.googleapis.com/bcdb_audio/big_ben_chimes.mp3",
         "type": "regex_any",
     },
     {
          "id": "twisted",
          "patterns": [r"\btwisted\b"],
-         "url": "https://storage.cloud.google.com/bcdb_audio/twisted.mp3",
+         "url": "https://storage.googleapis.com/bcdb_audio/twisted.mp3",
          "type": "regex_any",
     },
     {
          "id": "unbreakable",
          "patterns": [r"\bunbreakable\b"],
-         "url": "https://storage.cloud.google.com/bcdb_audio/unbreakable.mp3",
+         "url": "https://storage.googleapis.com/bcdb_audio/unbreakable.mp3",
          "type": "regex_any",
     },    
     {
          "id": "comedy_point",
          "patterns": [r"\bcomedy points\b"],
-         "url": "https://storage.cloud.google.com/bcdb_audio/comedy_point.mp3",
+         "url": "https://storage.googleapis.com/bcdb_audio/comedy_point.mp3",
          "type": "regex_any",
     },
 ]
@@ -319,6 +319,24 @@ def build_view_and_download_links(bucket_name: str, blob_name: str):
     download_btn = f'<a href="{public_url}" download target="_blank">Download</a>'
     return view_btn, download_btn
 
+def ensure_random_url(bucket_name: str, folder_path: str):
+    ctx = (bucket_name, folder_path)
+    if st.session_state.get("random_ctx") == ctx and st.session_state.get("random_url"):
+        return 
+
+    names = list_csv_blobs(bucket_name, None if folder_path == "all" else folder_path)
+    yt_url = None
+    if names:
+        attempts = min(20, len(names))
+        for _ in range(attempts):
+            candidate = random.choice(names)
+            yt_url = get_youtube_url_for_blob(bucket_name, candidate)
+            if yt_url:
+                break
+
+    st.session_state["random_ctx"] = ctx
+    st.session_state["random_url"] = yt_url
+
 st.markdown(f'<div style="text-align:center;"><img src="{LOGO_URL}" width="300"></div>', unsafe_allow_html=True)
 st.markdown("<h1 style='text-align:center;'><span style='color:#AE88E1;'>Blank Check </span><span style='color:#8E3497;'>Database</span></h1>", unsafe_allow_html=True)
 
@@ -396,37 +414,34 @@ search_term = st.text_input(
     on_change=_trigger_search,
 )
 
+ensure_random_url(bucket_name, folder_path)
+
 c1, c2, c3 = st.columns(3)
 with c1:
     search_clicked = st.button("Search", use_container_width=True)
 with c2:
     reset_clicked = st.button("Reset", type="primary", use_container_width=True)
 with c3:
-    random_clicked = st.button("Play Random Episode 🎲", use_container_width=True)
+    url = st.session_state.get("random_url")
+    if url:
+        try:
+            st.link_button("▶ Open random episode", url, use_container_width=True)
+        except Exception:
+            st.markdown(
+                f'<a href="{url}" target="_blank" rel="noopener">▶ Open random episode</a>',
+                unsafe_allow_html=True,
+            )
+    else:
+        st.button("▶ Open random episode", disabled=True, help="No YouTube link found", use_container_width=True)
 
 run_search = search_clicked or st.session_state.get('button_clicked', False)
 
 if reset_clicked:
     st.session_state['button_clicked'] = False
     st.session_state['page'] = 1
+    st.session_state.pop("random_url", None)
+    st.session_state.pop("random_ctx", None)
     st.rerun()
-
-if random_clicked:
-    names = list_csv_blobs(bucket_name, None if folder_path == "all" else folder_path)
-    if not names:
-        st.warning("No episodes available.")
-    else:
-        yt_url = None
-        attempts = min(20, len(names))
-        for _ in range(attempts):
-            candidate = random.choice(names)
-            yt_url = get_youtube_url_for_blob(bucket_name, candidate)
-            if yt_url:
-                break
-        if yt_url:
-            components.html(f"<script>window.open('{yt_url}', '_blank');</script>", height=0)
-        else:
-            st.warning("Couldn't find a YouTube link in the sampled episodes.")
 
 if run_search:
     term = search_term.strip()
