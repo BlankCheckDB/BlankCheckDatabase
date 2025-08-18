@@ -11,6 +11,9 @@ import streamlit as st
 from google.cloud import storage
 from google.oauth2 import service_account
 
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
 import random
 import streamlit.components.v1 as components
 
@@ -24,10 +27,10 @@ client = storage.Client(credentials=credentials)
 
 st.set_page_config(page_title="Blank Check Database", page_icon=":mag_right:")
 
-LOG_BUCKET = "bcdb_testing"
-RAW_LOG_PREFIX = "logs/searches/raw"
-AGG_PREFIX = "logs/searches/aggregated"
-AUTO_AGGREGATE_EVERY_MINUTES = 60
+SHEETS_SPREADSHEET_ID = "185kZdzb2_mzjqHyPTux1MuhatZuX3SzwnGcW4VMkbYk"
+SHEETS_TAB_NAME = "search_log" 
+
+AUTO_AGGREGATE_EVERY_MINUTES = 60 
 
 SOUND_TRIGGERS = [
     {
@@ -98,6 +101,11 @@ def _play_sound_once_per_term(trigger_id: str, term: str, sound_url: str):
 def get_gcs_client():
     return storage.Client(credentials=credentials)
 
+@st.cache_resource
+def get_sheets_service():
+    scoped = credentials.with_scopes(["https://www.googleapis.com/auth/spreadsheets"])
+    return build("sheets", "v4", credentials=scoped, cache_discovery=False)
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def list_csv_blobs(bucket_name: str, prefix: str | None):
     client = get_gcs_client()
@@ -156,71 +164,51 @@ def _get_session_id() -> str:
         st.session_state["session_id"] = str(uuid.uuid4())
     return st.session_state["session_id"]
 
+def _ensure_sheet_header():
+    try:
+        svc = get_sheets_service()
+        rng = f"{SHEETS_TAB_NAME}!A1:G1"
+        res = svc.spreadsheets().values().get(
+            spreadsheetId=SHEETS_SPREADSHEET_ID, range=rng
+        ).execute()
+        vals = res.get("values", [])
+        if not vals:
+            header = [["ts_utc", "session_id", "feed", "folder", "term", "results_count", "hour_utc"]]
+            svc.spreadsheets().values().update(
+                spreadsheetId=SHEETS_SPREADSHEET_ID,
+                range=rng,
+                valueInputOption="RAW",
+                body={"values": header},
+            ).execute()
+    except HttpError as e:
+        st.warning(f"Could not ensure header for {SHEETS_TAB_NAME}: {e}")
+
 def log_search_event(term: str, feed: str, folder: str, results_count: int):
     try:
-        client = get_gcs_client()
-        bucket = client.bucket(LOG_BUCKET)
-
+        _ensure_sheet_header()
         now = datetime.now(timezone.utc)
-        date_path = now.strftime("%Y/%m/%d")
-        payload = {
-            "ts": now.isoformat(),
-            "session_id": _get_session_id(),
-            "feed": feed,
-            "folder": folder,
-            "term": term,
-            "results_count": int(results_count),
-        }
-        blob_name = f"{RAW_LOG_PREFIX}/{date_path}/{now.strftime('%H%M%S')}_{uuid.uuid4().hex}.json"
-        bucket.blob(blob_name).upload_from_string(json.dumps(payload) + "\n", content_type="application/json")
+        svc = get_sheets_service()
+        row = [
+            now.isoformat(),
+            _get_session_id(),
+            feed,
+            folder,
+            term,
+            int(results_count),
+            now.strftime("%H"),
+        ]
+        svc.spreadsheets().values().append(
+            spreadsheetId=SHEETS_SPREADSHEET_ID,
+            range=f"{SHEETS_TAB_NAME}!A1",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]},
+        ).execute()
     except Exception as e:
-        print(f"[search logging skipped] {e}")
-
-def aggregate_day_to_csv(target_date=None):
-    try:
-        client = get_gcs_client()
-        bucket = client.bucket(LOG_BUCKET)
-        if target_date is None:
-            target_date = datetime.now(timezone.utc).date()
-        prefix = f"{RAW_LOG_PREFIX}/{target_date.strftime('%Y/%m/%d')}/"
-
-        rows = []
-        for b in bucket.list_blobs(prefix=prefix):
-            if b.name.endswith(".json"):
-                try:
-                    rows.append(json.loads(b.download_as_text()))
-                except Exception:
-                    pass
-
-        if not rows:
-            return None
-
-        df = pd.DataFrame(rows)
-        if "ts" in df.columns:
-            df["ts_utc"] = pd.to_datetime(df["ts"], utc=True)
-            df["date"] = df["ts_utc"].dt.date.astype(str)
-            df["hour_utc"] = df["ts_utc"].dt.strftime("%H")
-
-        out_blob = bucket.blob(f"{AGG_PREFIX}/{target_date.strftime('%Y-%m-%d')}/searches-{target_date.strftime('%Y-%m-%d')}.csv")
-        tmp = "/tmp/searches_today.csv"
-        df.to_csv(tmp, index=False)
-        out_blob.upload_from_filename(tmp, content_type="text/csv")
-        return f"https://storage.googleapis.com/{out_blob.bucket.name}/{out_blob.name}"
-    except Exception as e:
-        print(f"[aggregate failed] {e}")
-        return None
+        print(f"[search logging to Sheets skipped] {e}")
 
 def maybe_auto_aggregate():
-    try:
-        now = datetime.now(timezone.utc)
-        last = st.session_state.get("last_agg_ts")
-        if (last is None) or ((now - last) >= timedelta(minutes=AUTO_AGGREGATE_EVERY_MINUTES)):
-            url = aggregate_day_to_csv(now.date())
-            st.session_state["last_agg_ts"] = now
-            if url:
-                st.info(f"Updated today’s search CSV. [Open CSV]({url})")
-    except Exception:
-        pass
+    pass
 
 term_styles = {
     'comedy points': {'color': '#D4AF37', 'emoji': ''},
@@ -457,6 +445,7 @@ if run_search:
             results = searching(bucket_name, term, folder_path)
 
         total = sum(len(v) for v in results.values()) if results else 0
+
         log_search_event(term=term, feed=feed, folder=folder_choice, results_count=total)
 
         if not results:
