@@ -140,6 +140,24 @@ def cached_image_url(bucket_name: str, file_name: str):
             return f"https://storage.googleapis.com/{bucket.name}/{b.name}"
     return None
 
+def highest_numbered_csv(bucket_name: str, folder_path: str):
+    names = list_csv_blobs(bucket_name, None if folder_path == "all" else folder_path)
+    if not names:
+        return None, None
+
+    # Use your existing extract_number; filter out files with no digits (inf)
+    numbered = [(extract_number(os.path.basename(n)), n) for n in names]
+    numbered = [(num, n) for num, n in numbered if num != float("inf")]
+    if not numbered:
+        return None, None
+
+    max_num, max_name = max(numbered, key=lambda x: x[0])
+    return max_num, max_name
+
+def format_blob_title(blob_path: str) -> str:
+    stem = os.path.splitext(os.path.basename(blob_path))[0]
+    return stem[4:].replace('_', ' ')
+
 def get_youtube_url_for_blob(bucket_name: str, blob_name: str) -> str | None:
     client = get_gcs_client()
     blob = client.bucket(bucket_name).blob(blob_name)
@@ -158,6 +176,32 @@ def get_youtube_url_for_blob(bucket_name: str, blob_name: str) -> str | None:
     head0 = head.iloc[:, 0].astype(str).tolist() + ["", "", ""]
     youtube, _ = _first_urls_from_head0(head0)
     return youtube
+
+def get_external_urls_for_blob(bucket_name: str, blob_name: str) -> dict[str, str | None]:
+    client = get_gcs_client()
+    blob = client.bucket(bucket_name).blob(blob_name)
+    try:
+        head = pd.read_csv(
+            blob.open("rt"),
+            sep=";",
+            engine="c",
+            dtype=str,
+            nrows=3,
+            header=None,
+            on_bad_lines="skip",
+        )
+    except Exception:
+        return {"youtube": None, "patreon": None}
+
+    head0 = head.iloc[:, 0].astype(str).tolist() + ["", "", ""]
+    youtube, patreon = _first_urls_from_head0(head0)
+    return {"youtube": youtube, "patreon": patreon}
+
+def get_preferred_external_url_for_blob(bucket_name: str, blob_name: str, prefer: str = "youtube") -> str | None:
+    urls = get_external_urls_for_blob(bucket_name, blob_name)  # {'youtube': ..., 'patreon': ...}
+    if prefer == "patreon":
+        return urls.get("patreon") or urls.get("youtube")
+    return urls.get("youtube") or urls.get("patreon")
 
 def _get_session_id() -> str:
     if "session_id" not in st.session_state:
@@ -307,23 +351,24 @@ def build_view_and_download_links(bucket_name: str, blob_name: str):
     download_btn = f'<a href="{public_url}" download target="_blank">Download</a>'
     return view_btn, download_btn
 
-def ensure_random_url(bucket_name: str, folder_path: str):
-    ctx = (bucket_name, folder_path)
+def ensure_random_url(bucket_name: str, folder_path: str, feed: str):
+    ctx = (bucket_name, folder_path, feed)
     if st.session_state.get("random_ctx") == ctx and st.session_state.get("random_url"):
-        return 
+        return
 
     names = list_csv_blobs(bucket_name, None if folder_path == "all" else folder_path)
-    yt_url = None
+    url = None
     if names:
-        attempts = min(20, len(names))
+        attempts = min(50, len(names))
+        prefer = "patreon" if feed == "Patreon" else "youtube"
         for _ in range(attempts):
             candidate = random.choice(names)
-            yt_url = get_youtube_url_for_blob(bucket_name, candidate)
-            if yt_url:
+            url = get_preferred_external_url_for_blob(bucket_name, candidate, prefer=prefer)
+            if url:
                 break
 
     st.session_state["random_ctx"] = ctx
-    st.session_state["random_url"] = yt_url
+    st.session_state["random_url"] = url
 
 st.markdown(f'<div style="text-align:center;"><img src="{LOGO_URL}" width="300"></div>', unsafe_allow_html=True)
 st.markdown("<h1 style='text-align:center;'><span style='color:#AE88E1;'>Blank Check </span><span style='color:#8E3497;'>Database</span></h1>", unsafe_allow_html=True)
@@ -362,6 +407,20 @@ if 'page' not in st.session_state:
     st.session_state['page'] = 1
 if 'played_sounds' not in st.session_state:
     st.session_state['played_sounds'] = []
+
+pretty_by_folder = {v: k for k, v in folder_names.items() if v != "all"}
+
+def get_miniseries_for_blob(blob_path: str) -> str | None:
+    """
+    Returns the human-readable miniseries label for a blob,
+    preferring your existing folder_names mapping.
+    """
+    folder_path = os.path.dirname(blob_path)
+    if folder_path in pretty_by_folder:
+        return pretty_by_folder[folder_path]
+    base = os.path.basename(folder_path)
+    return base[4:].replace("_", " ") if base else None
+
 
 def _trigger_search():
     st.session_state['button_clicked'] = True
@@ -402,7 +461,7 @@ search_term = st.text_input(
     on_change=_trigger_search,
 )
 
-ensure_random_url(bucket_name, folder_path)
+ensure_random_url(bucket_name, folder_path, feed)
 
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -423,6 +482,41 @@ with c3:
         st.button("▶ Play random episode", disabled=True, help="No YouTube link found", use_container_width=True)
 
 run_search = search_clicked or st.session_state.get('button_clicked', False)
+
+max_num, max_blob = highest_numbered_csv(bucket_name, folder_path)
+if max_num is not None:
+    title = format_blob_title(max_blob)
+    urls = get_external_urls_for_blob(bucket_name, max_blob)
+
+    if feed == "Patreon" and urls["patreon"]:
+        ext_url, icon, label = urls["patreon"], PATREON_ICON, "Open on Patreon"
+    elif urls["youtube"]:
+        ext_url, icon, label = urls["youtube"], YOUTUBE_ICON, "Open on YouTube"
+    elif urls["patreon"]:
+        ext_url, icon, label = urls["patreon"], PATREON_ICON, "Open on Patreon"
+    else:
+        ext_url = None
+
+    mini = folder_choice if folder_choice != "All Miniseries" else get_miniseries_for_blob(max_blob)
+
+    st.markdown(
+        f"""
+        <div style="padding:10px;border:1px solid #eee;border-radius:8px;">
+          <div style="font-weight:700;color:#8E3497;">Latest episode added to database:</div>
+          <div style="font-size:14px;">
+            <b>Episode:</b> {title}<br>
+            <b>Miniseries:</b> {mini or "Unknown"}<br>
+            {(
+                f'<a href="{ext_url}" target="_blank" rel="noopener">'
+                f'  <img src="{icon}" width="20" style="vertical-align:middle;margin-right:6px;">{label}'
+                f'</a>'
+             ) if ext_url else "<span style='opacity:0.7;'>No external link found in CSV.</span>"}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 if reset_clicked:
     st.session_state['button_clicked'] = False
