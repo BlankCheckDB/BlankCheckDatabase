@@ -489,11 +489,11 @@ if max_num is not None:
     urls = get_external_urls_for_blob(bucket_name, max_blob)
 
     if feed == "Patreon" and urls["patreon"]:
-        ext_url, icon, label = urls["patreon"], PATREON_ICON, "Open on Patreon"
+        ext_url, icon, label = urls["patreon"], PATREON_ICON, "Open in Patreon"
     elif urls["youtube"]:
-        ext_url, icon, label = urls["youtube"], YOUTUBE_ICON, "Open on YouTube"
+        ext_url, icon, label = urls["youtube"], YOUTUBE_ICON, "Open in YouTube"
     elif urls["patreon"]:
-        ext_url, icon, label = urls["patreon"], PATREON_ICON, "Open on Patreon"
+        ext_url, icon, label = urls["patreon"], PATREON_ICON, "Open in Patreon"
     else:
         ext_url = None
 
